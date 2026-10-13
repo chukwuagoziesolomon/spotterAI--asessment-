@@ -2,7 +2,7 @@ from unittest import mock
 
 import numpy as np
 from django.core.cache import cache
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from .models import FuelStation
@@ -71,6 +71,18 @@ class ApiTests(TestCase):
 
     def test_validation(self):
         self.assertEqual(APIClient().get("/api/route/").status_code, 400)
+
+    @mock.patch("rest_framework.throttling.AnonRateThrottle.THROTTLE_RATES", {"anon": "2/minute"})
+    def test_anonymous_rate_limit_returns_429(self):
+        params = {"start": "40.0,-100.0", "finish": "40.0,-75.0"}
+        route = {"coords": self.coords, "distance_miles": 1400.0, "duration_minutes": 1200}
+        client = APIClient()
+        with mock.patch("planner.services.providers.get_route", return_value=route):
+            self.assertEqual(client.get("/api/route/", params).status_code, 200)
+            self.assertEqual(client.get("/api/route/", params).status_code, 200)
+            response = client.get("/api/route/", params)
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("Retry-After", response)
 
     def _get(self, params):
         route = {"coords": self.coords, "distance_miles": 1400.0, "duration_minutes": 1200}

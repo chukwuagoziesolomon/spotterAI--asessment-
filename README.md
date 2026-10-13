@@ -68,7 +68,8 @@ curl -G "http://127.0.0.1:8000/api/route/" --data-urlencode "start=Dallas, TX" -
 | `ModuleNotFoundError` | Virtual environment not activated, or step 2 skipped. |
 
 **Configuration (environment variables, all optional):** `GEO_USER_AGENT`, `OSRM_URL`, `NOMINATIM_URL`,
-`CORRIDOR_MILES` (default 10), `DJANGO_SECRET_KEY`, `DJANGO_DEBUG` (default 1; set 0 in production).
+`CORRIDOR_MILES` (default 10), `API_ANON_RATE` (default `30/minute` per client IP), `REDIS_URL` (enables
+shared Redis cache/throttle storage), `DJANGO_SECRET_KEY`, `DJANGO_DEBUG` (default 1; set 0 in production).
 
 ## API
 `GET /api/route/?start=Dallas, TX&finish=Seattle, WA`  (or `POST` JSON `{"start": "...", "finish": "..."}`; `"lat,lng"` also accepted)
@@ -87,12 +88,14 @@ gallons, cost), `total_fuel_cost`, `total_fuel_gallons_purchased`, `assumptions`
 - **Data cleaning** (fuel-prices CSV: 8,151 rows): 620 Canadian rows dropped; rows are one-per-price-listing
   (e.g. 678 station IDs repeat with different prices), so they are collapsed to one station per OPIS ID keeping
   the cheapest price -> 6,614 stations. 12 stations whose city isn't in the gazetteer are skipped.
-- **Speed**: the finished plan is cached too (key = endpoints + station-data version + settings), so a repeat
-  request skips routing AND optimisation (~3 ms vs ~300 ms cold on a cross-country route, excluding the
-  OSRM/Nominatim network time). Re-importing stations changes the version, so stale plans are never served.
-  Stations live in memory as numpy arrays; bounding-box pre-filter, then vectorised
-  nearest-point search against a ~1-mile-resolution downsample of the route. Typical latency is dominated
-  by the single OSRM call.
+- **Speed**: geocoding results, OSRM routes, and completed plans are cached for 24 hours. A plan-cache key
+  includes the resolved endpoints, station-data version, and planning settings, so a repeat request can skip
+  routing and optimisation; re-importing stations changes the version and prevents stale plans from being used.
+  Coordinates (`lat,lng`) skip geocoding. On a cache miss, the request makes at most two geocoding calls and
+  one OSRM call. For computation, stations are loaded into NumPy arrays, filtered by a route bounding box,
+  and searched against a route downsampled to about one-mile intervals using vectorised nearest-point
+  calculations. This keeps the local planning work small; on a cold request, external provider latency is
+  usually the main variable.
 - **Optimiser** (`planner/services/optimizer.py`): greedy gas-station algorithm, optimal for continuous
   fuel purchase. Buy just enough to reach a cheaper station ahead; otherwise fill up; destination is a
   free virtual station at the end.
@@ -135,7 +138,16 @@ gallons, cost), `total_fuel_cost`, `total_fuel_gallons_purchased`, `assumptions`
   cost-optimal but a real driver might prefer fewer, larger purchases.
 
 ## Production notes
-- `LocMemCache` is per process; use Redis (`django.core.cache.backends.redis.RedisCache`) when running several workers.
+- The route API uses Django REST Framework's anonymous throttle: **30 requests per minute per client IP** by
+  default. Requests over the limit receive HTTP `429` and a `Retry-After` header. Set `API_ANON_RATE` to a
+  DRF rate such as `60/hour` to change it. Clients behind the same NAT/proxy share an IP-based limit.
+- The default `LocMemCache` is per process and is suitable for local development or a single process only.
+  Set `REDIS_URL` (for example, `redis://127.0.0.1:6379/1`) to use Django's Redis cache backend; this shares
+  throttle counters and cached plans across workers. Keep Redis private and configure its credentials/network
+  access in deployment.
+- DRF throttling is a per-client application limit, not a strict global cap or DDoS protection. Configure
+  trusted client-IP forwarding at your proxy, and continue to follow OSRM/Nominatim usage policies; for
+  significant public traffic, use a provider with an appropriate service agreement.
 - The public OSRM/Nominatim servers are demo services. Self-host them or use a paid provider in production.
 - Next speed-ups: KD-tree (`scipy.spatial.cKDTree`) for the station search, PostGIS `ST_DWithin` for the corridor
   query, route simplification / gzip for large GeoJSON responses, an async view with `httpx`.
@@ -144,7 +156,7 @@ gallons, cost), `total_fuel_cost`, `total_fuel_gallons_purchased`, `assumptions`
 
 Run the automated suite with `python manage.py test` (no internet needed: routing is mocked).
 
-**Automated tests: 13 run, 13 passed.**
+**Automated tests: 14 run, 14 passed.**
 
 | Area | Test | What it proves |
 |---|---|---|
@@ -156,6 +168,7 @@ Run the automated suite with `python manage.py test` (no internet needed: routin
 | Geometry | nearest point on route | Station distance and mile marker are computed correctly |
 | API | plan | Returns stops, GeoJSON route, and exactly **one** routing call |
 | API | validation | Missing `start`/`finish` returns 400 |
+| API | anonymous rate limit | Requests over the configured limit return 429 with `Retry-After` |
 | API | repeat request served from plan cache | Second identical request makes 0 routing calls |
 | API | cache invalidated when stations change | A data reload forces a recompute |
 | API | same start and finish | Returns 200, no stops |
@@ -165,6 +178,13 @@ Run the automated suite with `python manage.py test` (no internet needed: routin
 **Manual verification on the real CSV** (done with a straight-line stand-in route, because the development
 sandbox could not reach OSRM; the live OSRM/Nominatim calls were not exercised there, so check them locally):
 
+The timings below are **planning/compute timings**, not end-to-end Postman response times: they exclude
+network time to OSRM and Nominatim. Real response time depends on whether each provider result is cached and
+on network/provider speed. Each uncached provider request has a configured 15-second timeout; a cold request
+with two free-text endpoints can make three sequential provider calls, so slow or unavailable providers can
+add substantial delay (roughly 45 seconds across three timeouts, potentially longer depending on connection
+behavior). Using coordinates removes the two geocoding calls.
+
 | Check | Result |
 |---|---|
 | Import | 8,151 rows read, 620 non-US dropped, duplicates collapsed, **6,614 stations loaded** (12 skipped: city not in gazetteer) |
@@ -172,7 +192,7 @@ sandbox could not reach OSRM; the live OSRM/Nominatim calls were not exercised t
 | Dallas to Seattle | 1,944 mi, 12 stops, $460.93 total |
 | Los Angeles to New York | 2,841 mi, 17 stops, $714.03 total |
 | Houston to Austin | 168 mi, 0 stops, $0 (starts with a full tank, see assumptions) |
-| Cold request (cross-country) | about 280 ms of compute, excluding OSRM/Nominatim network time |
-| Repeated request | about 3 ms, 0 additional routing calls |
+| Cold request (cross-country) | about 280 ms of compute with a stand-in route; excludes OSRM/Nominatim network time |
+| Repeated request | about 3 ms of compute, 0 additional provider calls when cached; local measurement |
 | California coverage | Only 8 California stations in the file; stations near LA/SF do not exist (see edge cases) |
 | San Francisco to Seattle, Seattle to Los Angeles (straight-line stand-in) | Returned 422 "no station within range". Straight-line routes are not road-accurate, so this is indicative only; real I-5 trips are likely affected by the same data gap |
