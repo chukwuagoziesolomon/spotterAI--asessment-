@@ -83,11 +83,8 @@ gallons, cost), `total_fuel_cost`, `total_fuel_gallons_purchased`, `assumptions`
 - **External calls**: OSRM public server for routing (no key), Nominatim for geocoding. One OSRM call per
   route; geocoding only for free-text inputs (so 3 calls max, 1 if "lat,lng" is passed). All results cached,
   so repeats cost 0 calls.
-- **Stations are located once at import** (by city/state) using the bundled offline US cities gazetteer
-  (`data/us_cities.csv`), with Nominatim only as a fallback for misses. Never at request time.
-- **Data cleaning** (fuel-prices CSV: 8,151 rows): 620 Canadian rows dropped; rows are one-per-price-listing
-  (e.g. 678 station IDs repeat with different prices), so they are collapsed to one station per OPIS ID keeping
-  the cheapest price -> 6,614 stations. 12 stations whose city isn't in the gazetteer are skipped.
+- **Station locations** are resolved once during the data import, not during route requests. See Fuel-price
+  data notes below for the source-data cleanup and coordinate lookup details.
 - **Speed**: geocoding results, OSRM routes, and completed plans are cached for 24 hours. A plan-cache key
   includes the resolved endpoints, station-data version, and planning settings, so a repeat request can skip
   routing and optimisation; re-importing stations changes the version and prevents stale plans from being used.
@@ -121,15 +118,21 @@ gallons, cost), `total_fuel_cost`, `total_fuel_gallons_purchased`, `assumptions`
 | Inputs with spaces or `&` | `map_url` is URL-encoded. |
 
 **Fuel-price data notes** (`fuel-prices.csv`, 8,151 rows):
-- 620 Canadian rows are dropped; rows are one-per-price-listing, so they are collapsed to one station per OPIS ID
-  keeping the cheapest price (6,614 stations). 12 stations whose city is not in the gazetteer are skipped.
-- Stations are located by **city centre**, not exact address (the file has only highway-exit text), so a stop's
-  pin can be a few miles off. This is why stations within 10 miles of the route are considered.
-- **Coverage gap: the file has only 8 California stations**, all in the far south-east desert, and none near
-  Los Angeles or San Francisco. Trips whose fuel stops would fall in California (for example along I-5 between
-  Oregon and Southern California) can return `422`, because there is nothing within 500 miles to buy fuel from.
-  This is a limit of the data, not of the algorithm. Trips that start in California on a full tank and leave
-  towards Arizona/Nevada work normally.
+
+The source has no coordinates. I dropped 620 Canadian rows and collapsed repeated price listings to one record
+per OPIS station ID, keeping the cheapest price; this left 6,614 stations. To locate them without sending
+thousands of city lookups to an online geocoder, the import uses the bundled offline US cities file
+(`data/us_cities.csv`) to map each city/state to an approximate city-centre coordinate. It matches about 99.8%
+of the assessment data; Nominatim is only a rate-limited fallback for misses. Twelve stations could not be
+located and were skipped. These coordinates are approximate rather than exact station addresses, which is why
+the planner considers stations within 10 miles of the route. Station coordinates are resolved at import time;
+the route API does not geocode stations per request.
+
+**Coverage gap:** the fuel file has only 8 California stations, all in the far south-east desert, and none near
+Los Angeles or San Francisco. Trips whose fuel stops would fall in California (for example along I-5 between
+Oregon and Southern California) can return `422`, because there is nothing within 500 miles to buy fuel from.
+This is a limitation of the dataset, not the algorithm. Trips that start in California on a full tank and leave
+towards Arizona/Nevada work normally.
 
 **Pricing assumptions**
 - The vehicle starts with a full 500-mile tank that is **not billed**; only fuel bought en route is costed.
